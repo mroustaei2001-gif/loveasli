@@ -1,0 +1,12 @@
+[Unit]
+Description=Test Publish Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/root
+ExecStart=/root/venv/bin/python /root/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
