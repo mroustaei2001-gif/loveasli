@@ -1,3 +1,4 @@
+import shutil
 import os, re, random, asyncio, logging, sqlite3, subprocess
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 API_ID = 34162330
 API_HASH = '3bb051fd52ebd9b40999d16070589fc2'
-BOT_TOKEN = '8947858081:AAGxsa0WsRCQr_tCL0UPm3SHDOzlzGGQTEg'
+BOT_TOKEN = '8822939635:AAFL0R9R-OolOdMNy_H1uAWY2JcxIKtiuS8'
 ADMINS = [8810172664, 6282695098]
 MEDIA_DIR = 'media'
 os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -29,6 +30,13 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
+
+# Ensure premium session is accessible
+if os.path.exists('/root/premium_session.session') and not os.path.exists('premium_session.session'):
+    shutil.copy('/root/premium_session.session', 'premium_session.session')
+if os.path.exists('/root/premium_session.session-journal') and not os.path.exists('premium_session.session-journal'):
+    shutil.copy('/root/premium_session.session-journal', 'premium_session.session-journal')
+
 telethon_client = TelegramClient('reader_session', API_ID, API_HASH)
 premium_client = TelegramClient('premium_session', API_ID, API_HASH)
 PUBLISH_ERR = None
@@ -1125,6 +1133,7 @@ async def cb_pub_final(callback: types.CallbackQuery):
 
 async def publish_all_approved(chat_id):
     global PUBLISH_ERR, PREMIUM_ERR, DBG
+    wait_msg = await bot.send_message(chat_id, "⏳ لطفاً صبر کنید تا پست‌ها ارسال شوند...")
     try:
         PREMIUM_ERR = None
         async with aiosqlite.connect('auto_pub.db') as conn:
@@ -1138,6 +1147,8 @@ async def publish_all_approved(chat_id):
         elif PREMIUM_ERR: msg += f"\n⚠️ اکانت پریمیوم نفرستاد ({PREMIUM_ERR[:150]}) — پست‌ها بدون ایموجی پریمیوم رفتند. اکانت پریمیوم را عضو کانال کن!"
         DBG_LIST.clear()
         msg += "\n🔍 " + " | ".join(DBG_LIST[-8:])
+        try: await wait_msg.delete()
+        except Exception: pass
         try: await status_msg.delete()
         except Exception: pass
         try:
@@ -1177,9 +1188,11 @@ async def do_publish(pid):
         def tlen(s): return len(s.encode('utf-16-le')) // 2
         def strip_prem(s):
             return re.sub(r'<tg-emoji[^>]*>([^<]*)</tg-emoji>', lambda mm: mm.group(1), s)
+        def remove_emoji_tags(s):
+            return re.sub(r'<tg-emoji[^>]*>[^<]*</tg-emoji>', '', s)
         body_full = format_text(text or '', fmt)
         cap_footer = ''
-        if (await db.get('cap_emoji')) == '1':
+        if not is_spoiler and (await db.get('cap_emoji')) == '1':
             cap_raw = (await db.get('cap_emoji_tag')) or ''
             cap_em = get_emojis(cap_raw)
             pool = list(dict.fromkeys(cap_em))[:200] if cap_em else [t.strip() for t in cap_raw.split('|||||') if t.strip()][:200]
@@ -1214,7 +1227,7 @@ async def do_publish(pid):
         em = random.choice(id_em) if id_em else ''
         em_used = ((await db.get('sp_id_emoji')) or '🆔') if is_spoiler else em
         ch_part = f"{NL}{NL}<blockquote>{em_used} <b>{ch_name}</b></blockquote>"
-        extra_part = f"{NL}{NL}<blockquote>{extra}</blockquote>" if extra else ""
+        extra_part = f"{NL}<blockquote>{extra}</blockquote>" if extra else ""
         base_part = f"{NL}{NL}<blockquote>{base_footer}</blockquote>" if base_footer else ""
         
         # فوتر پروکسی - بین ایموجی کپشن و فوتر رندوم
@@ -1275,7 +1288,7 @@ async def do_publish(pid):
         sent_via = 'none'
         prem_exists = os.path.exists('premium_session.session')
         if is_spoiler and path:
-            cap2 = strip_prem(caption)
+            cap2 = remove_emoji_tags(strip_prem(caption))
             try:
                 if path.endswith('.mp4'):
                     await bot.send_animation(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML, has_spoiler=True)
@@ -1287,7 +1300,7 @@ async def do_publish(pid):
                 PUBLISH_ERR = str(e1)
         elif is_spoiler and not path:
             body_html = format_text(text or '', fmt)
-            cap_html = strip_prem(pre) + '<tg-spoiler>' + body_html + '</tg-spoiler>' + strip_prem(extra_part) + strip_prem(cap_footer) + strip_prem(proxy_footer) + strip_prem(base_part) + strip_prem(ch_part)
+            cap_html = remove_emoji_tags(strip_prem(pre)) + '<tg-spoiler>' + body_html + '</tg-spoiler>' + remove_emoji_tags(strip_prem(extra_part)) + remove_emoji_tags(strip_prem(cap_footer)) + remove_emoji_tags(strip_prem(proxy_footer)) + remove_emoji_tags(strip_prem(base_part)) + remove_emoji_tags(strip_prem(ch_part))
             try:
                 await bot.send_message(channel, cap_html, parse_mode=ParseMode.HTML)
                 sent = True
@@ -1448,6 +1461,8 @@ async def publish_all_scheduled(chat_id):
         msg = f"✅ {n} از {len(rows)} پست منتشر شد."
         if n < len(rows): msg += f"\n❌ خطا: {PUBLISH_ERR or 'نامشخص'}"
         elif PREMIUM_ERR: msg += f"\n⚠️ اکانت پریمیوم نفرستاد ({PREMIUM_ERR[:150]}) — بدون ایموجی پریمیوم. اکانت پریمیوم را عضو کانال کن!"
+        try: await wait_msg.delete()
+        except Exception: pass
         try: await status_msg.delete()
         except Exception: pass
         await cleanup_chat(chat_id)
@@ -1497,10 +1512,17 @@ async def msg_set_cap_emoji_count(message: types.Message, state: FSMContext):
 
 def strip_links(t):
     if not t: return ''
+    # حذف لینک‌های http/https
     t = re.sub(r'https?://\S+', '', t)
+    # حذف t.me/...
     t = re.sub(r't\.me/\S+', '', t, flags=re.I)
+    # حذف www.xxx
     t = re.sub(r'www\.\S+', '', t, flags=re.I)
+    # حذف دامنه‌های com/net/org/ir بدون پروتکل (مثل example.com)
+    t = re.sub(r'\b[A-Za-z0-9.-]+\.(com|net|org|ir|io|co|biz|info|me|xyz|top)\b', '', t, flags=re.I)
+    # حذف یوزرنیم‌های @
     t = re.sub(r'@[A-Za-z0-9_]{4,}', '', t)
+    # حذف فاصله‌های اضافی
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
