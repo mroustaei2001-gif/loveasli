@@ -11,6 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from telethon import TelegramClient
+from telethon import utils
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
 logging.basicConfig(level=logging.INFO)
@@ -84,6 +85,7 @@ class States(StatesGroup):
     set_pre_fixed = State()
     set_pre_count = State()
     set_pre_tag = State()
+    set_private_src = State()
     set_sp_pre = State()
     set_rand_footer = State()
     set_proxy_text = State()
@@ -91,6 +93,7 @@ class States(StatesGroup):
     set_prev_caption = State()
 
 import re
+import time
 def get_emojis(text):
     tags = re.findall(r'<tg-emoji[^>]*>.*?</tg-emoji>', text)
     if tags: return tags
@@ -532,6 +535,74 @@ async def msg_set_pre_tag(message: types.Message, state: FSMContext):
     await message.answer(f"✅ استخر ایموجی رندوم اول: {len(tags[:200])}", reply_markup=menu_kb())
     await state.clear()
 
+@router.callback_query(F.data == "set_private_src")
+async def cb_set_private_src(callback: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(callback.from_user.id, "🔐 لینک خصوصی کانال را بفرست (t.me/+...):\nربات عضو می‌شود و با آیدی عددی ذخیره می‌کند:")
+    await state.set_state(States.set_private_src)
+    await callback.answer()
+
+@router.message(States.set_private_src)
+async def msg_set_private_src(message: types.Message, state: FSMContext):
+    from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+    link = (message.text or '').strip()
+    hm = re.search(r'(?:\+|joinchat/)([A-Za-z0-9_\-]+)', link)
+    if not hm:
+        await message.answer("❌ لینک معتبر نیست. مثال: t.me/+ABC123")
+        await state.clear(); return
+    h = hm.group(1)
+    cid = None
+    err = ''
+    try:
+        if not telethon_client.is_connected(): await telethon_client.connect()
+        up = await telethon_client(ImportChatInviteRequest(h))
+        if up.chats: cid = utils.get_peer_id(up.chats[0])
+    except Exception as e1:
+        err = str(e1)
+        logger.error(f"import invite: {e1}")
+    if not cid:
+        try:
+            inv = await telethon_client(CheckChatInviteRequest(h))
+            title = (getattr(inv,'title',None) or '').strip().lower()
+            if title:
+                async for d in telethon_client.iter_dialogs():
+                    dt = (d.title or '').strip().lower()
+                    if dt == title or title in dt or dt in title:
+                        cid = d.id; break
+        except Exception as e2:
+            err += ' | ' + str(e2)
+    # اگر هنوز پیدا نشد و قبلاً عضو بوده، لیست کانال‌های خصوصی را نشان بده
+    if not cid and 'already a participant' in err:
+        cands = []
+        try:
+            async for d in telethon_client.iter_dialogs():
+                ent = getattr(d,'entity',None)
+                if ent and getattr(ent,'username',None): continue
+                if getattr(d,'is_channel',False) or getattr(d,'is_group',False):
+                    cands.append((d.id, d.title or 'بدون نام'))
+                if len(cands) >= 30: break
+        except Exception as e3:
+            logger.error(f"dialogs: {e3}")
+        if cands:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📺 {t[:30]}", callback_data=f"pickpriv_{i}")] for i,t in cands])
+            await message.answer("ℹ️ اکانت قبلاً عضو است. کانال موردنظر را انتخاب کن:", reply_markup=kb)
+            await state.clear(); return
+    if cid:
+        async with aiosqlite.connect('auto_pub.db') as conn:
+            await conn.execute("INSERT INTO sources (username) VALUES (?)", (str(cid),))
+            await conn.commit()
+        await message.answer(f"✅ منبع خصوصی ذخیره شد (آیدی عددی: {cid}).", reply_markup=menu_kb())
+    else:
+        await message.answer(f"❌ خطا: {err[:300]}", reply_markup=menu_kb())
+    await state.clear()
+
+@router.callback_query(F.data.startswith("pickpriv_"))
+async def cb_pickpriv(callback: types.CallbackQuery):
+    cid = int(callback.data.split("_")[1])
+    async with aiosqlite.connect('auto_pub.db') as conn:
+        await conn.execute("INSERT INTO sources (username) VALUES (?)", (str(cid),))
+        await conn.commit()
+    await callback.answer(f"✅ منبع خصوصی ذخیره شد: {cid}")
+
 async def show_id_view(chat_id):
     tag = (await db.get('id_emoji_tag')) or ''
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -668,71 +739,145 @@ async def cb_new_batch(callback: types.CallbackQuery):
     except Exception: pass
 
 async def generate_batch(chat_id):
-    if not telethon_client.is_connected():
-        await telethon_client.connect()
+    if not telethon_client.is_connected(): await telethon_client.connect()
     async with aiosqlite.connect('auto_pub.db') as conn:
         sources = await (await conn.execute("SELECT id, username FROM sources")).fetchall()
         used = set()
-        for r in await (await conn.execute("SELECT source, msg_id FROM published")).fetchall():
-            used.add((r[0], r[1]))
-        for r in await (await conn.execute("SELECT source, msg_id FROM batch_posts")).fetchall():
-            used.add((r[0], r[1]))
+        for r in await (await conn.execute("SELECT source, msg_id FROM published")).fetchall(): used.add((r[0],r[1]))
+        for r in await (await conn.execute("SELECT source, msg_id FROM batch_posts")).fetchall(): used.add((r[0],r[1]))
     if not sources:
         return await bot.send_message(chat_id, "⚠️ منبعی نیست.", reply_markup=menu_kb())
-    pool = []
-    srcs = list(sources)
-    random.shuffle(srcs)
-    for sid, uname in srcs:
-        uname = uname.strip()
-        if uname.startswith('http'): uname = uname.split('/')[-1]
-        uname = uname.lstrip('@').strip('/').rstrip('.')
-        got = []
+    GROUP_SIZE=5
+    total_groups=(len(sources)+GROUP_SIZE-1)//GROUP_SIZE
+    cur_idx_str=await db.get('batch_group_index')
+    try: cur_idx=int(cur_idx_str) if cur_idx_str else 0
+    except Exception: cur_idx=0
+    cur_idx=cur_idx%total_groups
+    excl=set(); main_id=None
+    mc=((await db.get('main_channel')) or '').strip().lstrip('@')
+    if mc: excl.add(mc.lower())
+    try:
+        me=await bot.get_me()
+        if me.username: excl.add(me.username.lower())
+    except Exception: pass
+    try:
+        chat=await bot.get_chat(((await db.get('main_channel')) or '').strip())
+        if getattr(chat,'username',None): excl.add(chat.username.lower())
+        main_id=chat.id
+    except Exception:
         try:
-            entity = await resolve_source(uname)
-            if entity and str(uname).startswith('+'):
-                await conn.execute("UPDATE sources SET username=? WHERE id=?", (str(utils.get_peer_id(entity)), sid))
-            async for m in telethon_client.iter_messages(entity, limit=30):
-                if not m: continue
-                if (uname, m.id) in used: continue
-                has_sp = bool(getattr(m, 'media_spoiler', False)) or any(getattr(e,'type','')=='spoiler' for e in (m.entities or []))
-                dt = m.date
-                if isinstance(m.media, MessageMediaPhoto):
-                    got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'photo', dt))
-                elif isinstance(m.media, MessageMediaDocument) and m.file and m.file.mime_type=='video/mp4':
-                    got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'gif', dt))
-                elif m.grouped_id and (isinstance(m.media, MessageMediaPhoto) or isinstance(m.media, MessageMediaDocument)):
-                    got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'album', dt))
-                elif not m.media and m.text and m.text.strip():
-                    got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'text', dt))
-                if len(got) >= 4: break
-        except Exception as e:
-            logger.error(f"fetch {uname}: {e}")
-        pool.extend(got)
-    if not pool:
-        return await bot.send_message(chat_id, "⚠️ پستی پیدا نشد.", reply_markup=menu_kb())
-    media_items=[t for t in pool if t[4]!='text']
-    text_items=[t for t in pool if t[4]=='text']
-    random.shuffle(media_items); random.shuffle(text_items)
-    text_part=text_items[:1] if text_items else []
-    media_part=media_items[:4]
-    if len(media_part)<4:
-        media_part+=media_items[4:8]
-        media_part+=text_items[1:5-len(media_part)]
-    sel=text_part+media_part
-    random.shuffle(sel)
-    chosen=[list(t)[:5] for t in sel[:5]]
+            ment=await telethon_client.get_entity(((await db.get('main_channel')) or '').strip())
+            main_id=utils.get_peer_id(ment)
+            if getattr(ment,'username',None): excl.add(ment.username.lower())
+        except Exception: pass
 
+    srcs=sources[cur_idx*GROUP_SIZE:(cur_idx+1)*GROUP_SIZE]
+    media_all=[]; text_all=[]; seen_grouped=set(); errs=[]
+    deadline=time.monotonic()+10
     async with aiosqlite.connect('auto_pub.db') as conn:
-        cur = await conn.execute("INSERT INTO batches (admin_id, created_at) VALUES (?, ?)", (chat_id, datetime.now().isoformat()))
-        batch_id = cur.lastrowid
-        ids = []
-        for uname, mid, txt, sp, kind in chosen:
-            cur2 = await conn.execute("INSERT INTO batch_posts (batch_id, source, msg_id, text, media, is_spoiler) VALUES (?,?,?,?,?,?)", (batch_id, uname, mid, txt, (0 if kind=="text" else 1), sp))
+        for sid,uname in srcs:
+            if time.monotonic()>deadline: break
+            uname=uname.strip()
+            if uname.startswith('http'): uname=uname.split('/')[-1]
+            uname=uname.lstrip('@').strip('/').rstrip('.')
+            if uname.lower() in excl: continue
+            try:
+                try:
+                    if uname.lstrip('-').isdigit():
+                        entity=await telethon_client.get_entity(int(uname))
+                    else:
+                        entity=await resolve_source(uname)
+                except Exception as e1:
+                    try:
+                        hm=re.search(r'(?:\+|joinchat/)([A-Za-z0-9_\-]+)',uname)
+                        if hm:
+                            from telethon.tl.functions.messages import ImportChatInviteRequest
+                            up=await telethon_client(ImportChatInviteRequest(hm.group(1)))
+                            if up.chats: entity=up.chats[0]
+                            else: entity=None
+                        else: entity=None
+                    except Exception as e2:
+                        entity=None
+                if not entity:
+                    errs.append(f"{uname}: resolve"); continue
+                try: eid=int(uname) if uname.lstrip('-').isdigit() else utils.get_peer_id(entity)
+                except Exception: eid=None
+                if main_id and eid and eid==main_id: continue
+                if str(uname).startswith('+'):
+                    await conn.execute("UPDATE sources SET username=? WHERE id=?", (str(utils.get_peer_id(entity)), sid))
+                async for m in telethon_client.iter_messages(entity, limit=200):
+                    if time.monotonic()>deadline: break
+                    if not m: continue
+                    is_used=(uname,m.id) in used
+                    if getattr(m,'sticker',None): continue
+                    if isinstance(m.media,MessageMediaDocument) and m.file and ('webp' in (m.file.mime_type or '') or 'webm' in (m.file.mime_type or '')): continue
+                    has_sp=bool(getattr(m,'media_spoiler',False)) or any(getattr(e,'type','')=='spoiler' for e in (m.entities or []))
+                    _txt=m.text or ''
+                    if re.search(r'https?://|t\.me/|www\.|telegram\.me', _txt, re.I): continue
+                    if any(getattr(e,'type','') in ('url','text_link') for e in (m.entities or [])): continue
+                    ct=clean_text(_txt)
+                    ct=re.sub(r'@[A-Za-z0-9_]{4,}','',ct)
+                    ct=re.sub(r'\s+',' ',ct).strip()
+                    item=None
+                    if m.grouped_id:
+                        if m.grouped_id in seen_grouped: continue
+                        seen_grouped.add(m.grouped_id)
+                        if isinstance(m.media,(MessageMediaPhoto,MessageMediaDocument)):
+                            item=(uname,m.id,ct,1 if has_sp else 0,'album',m.date)
+                    elif isinstance(m.media,MessageMediaPhoto):
+                        item=(uname,m.id,ct,1 if has_sp else 0,'photo',m.date)
+                    elif isinstance(m.media,MessageMediaDocument) and m.file and m.file.mime_type=='video/mp4':
+                        item=(uname,m.id,ct,1 if has_sp else 0,'gif',m.date)
+                    elif not m.media and ct and len(ct)>=3:
+                        item=(uname,m.id,ct,1 if has_sp else 0,'text',m.date)
+                    if item:
+                        if item[4]=='text': text_all.append((is_used,item))
+                        else: media_all.append((is_used,item))
+            except Exception as ex:
+                errs.append(f"{uname}: {str(ex)[:40]}")
+                logger.error(f"fetch {uname}: {ex}")
+    # گروه‌بندی بر اساس منبع
+    from_src = {}
+    for is_used, item in media_all + text_all:
+        if item[4] == 'text' and len(item[2] or '') < 3: continue
+        uname = item[0]
+        if uname not in from_src: from_src[uname] = []
+        from_src[uname].append((is_used, item))
+    chosen = []
+    src_list = list(from_src.keys())
+    random.shuffle(src_list)
+    for uname in src_list:
+        if len(chosen) >= 5: break
+        items = sorted(from_src[uname], key=lambda x: x[0])
+        chosen.append(items[0][1])
+    if len(chosen) < 5:
+        all_items = []
+        for uname in from_src:
+            for is_used, item in from_src[uname]:
+                all_items.append((is_used, item))
+        all_items.sort(key=lambda x: x[0])
+        for is_used, item in all_items:
+            if len(chosen) >= 5: break
+            if item in chosen: continue
+            chosen.append(item)
+    await db.set('batch_group_index', str((cur_idx+1)%total_groups))
+    if not chosen:
+        msg=f"⚠️ پستی از دسته {cur_idx+1}/{total_groups} پیدا نشد."
+        if errs: msg+="\n🔍 " + " | ".join(errs[:5])
+        return await bot.send_message(chat_id, msg, reply_markup=menu_kb())
+    random.shuffle(chosen)
+    final=chosen[:5]
+    async with aiosqlite.connect('auto_pub.db') as conn:
+        cur=await conn.execute("INSERT INTO batches (admin_id, created_at) VALUES (?,?)",(chat_id,datetime.now().isoformat()))
+        batch_id=cur.lastrowid
+        ids=[]
+        for uname,mid,txt,sp,kind,dt in final:
+            cur2=await conn.execute("INSERT INTO batch_posts (batch_id,source,msg_id,text,media,is_spoiler) VALUES (?,?,?,?,?,?)",(batch_id,uname,mid,txt,(0 if kind=='text' else 1),sp))
             ids.append(cur2.lastrowid)
         await conn.commit()
-    await bot.send_message(chat_id, f"🎲 {len(ids)} پست برای بررسی:", reply_markup=menu_kb())
-    for pid in ids:
-        await send_preview(chat_id, pid)
+    srcs_names=list(set(t[0] for t in final))
+    await bot.send_message(chat_id, f"🎲 دسته {cur_idx+1}/{total_groups} - {len(ids)} پست از {len(srcs_names)} منبع:", reply_markup=menu_kb())
+    for pid in ids: await send_preview(chat_id,pid)
 
 PREVIEW_MSGS=[]
 PREVIEW_PID={}
@@ -1017,13 +1162,15 @@ async def do_publish(pid):
         source, mid, text, media, pfmt, pfoot, is_spoiler = row
         is_spoiler = bool(is_spoiler)
         fmt = pfmt or await db.get('format')
-        footer = pfoot if pfoot is not None else await db.get('footer')
+        extra = pfoot or ''
         rpool = [x.strip() for x in ((await db.get('rand_footer')) or '').split('|||||') if x.strip()]
         if rpool:
-            footer = random.choice(rpool)
-        elif footer:
-            fpool = [x.strip() for x in re.split(r'\|\|\|\|\||\n', footer) if x.strip()]
-            if fpool: footer = random.choice(fpool)
+            base_footer = random.choice(rpool)
+        else:
+            base_footer = (await db.get('footer')) or ''
+            if base_footer:
+                fpool = [x.strip() for x in re.split(r'\|\|\|\|\||\n', base_footer) if x.strip()]
+                if fpool: base_footer = random.choice(fpool)
         ch = (await db.get('main_channel')).strip()
         try: channel = int(ch)
         except ValueError: channel = ch
@@ -1067,7 +1214,8 @@ async def do_publish(pid):
         em = random.choice(id_em) if id_em else ''
         em_used = ((await db.get('sp_id_emoji')) or '🆔') if is_spoiler else em
         ch_part = f"{NL}{NL}<blockquote>{em_used} <b>{ch_name}</b></blockquote>"
-        foot_part = f"{NL}{NL}<blockquote>{footer}</blockquote>" if footer else ""
+        extra_part = f"{NL}{NL}<blockquote>{extra}</blockquote>" if extra else ""
+        base_part = f"{NL}{NL}<blockquote>{base_footer}</blockquote>" if base_footer else ""
         
         # فوتر پروکسی - بین ایموجی کپشن و فوتر رندوم
         proxy_footer = ''
@@ -1076,14 +1224,14 @@ async def do_publish(pid):
             proxy_linked = make_proxy_link(proxy_text)
             proxy_footer = f"{NL}{NL}<blockquote>{proxy_linked}</blockquote>"
         
-        allowed = 1024 - tlen(pre) - tlen(foot_part) - tlen(proxy_footer) - tlen(ch_part) - tlen(cap_footer) - 60
+        allowed = 1024 - tlen(pre) - tlen(extra_part) - tlen(base_part) - tlen(proxy_footer) - tlen(ch_part) - tlen(cap_footer) - 60
         body = truncate_html(body_full, max(200, allowed))
         def build_caption(b):
             if media:
-                cb = b + cap_footer
+                cb = b + extra_part + cap_footer
             else:
-                cb = (f"<tg-spoiler>{b}</tg-spoiler>" if is_spoiler else b) + cap_footer
-            return pre + cb + proxy_footer + foot_part + ch_part
+                cb = (f"<tg-spoiler>{b}</tg-spoiler>" if is_spoiler else b) + extra_part + cap_footer
+            return pre + cb + proxy_footer + base_part + ch_part
         caption = build_caption(body)
         guard = 0
         while tlen(caption) > 1024 and guard < 10:
@@ -1139,7 +1287,7 @@ async def do_publish(pid):
                 PUBLISH_ERR = str(e1)
         elif is_spoiler and not path:
             body_html = format_text(text or '', fmt)
-            cap_html = strip_prem(pre) + '<tg-spoiler>' + body_html + '</tg-spoiler>' + strip_prem(cap_footer) + strip_prem(proxy_footer) + strip_prem(foot_part) + strip_prem(ch_part)
+            cap_html = strip_prem(pre) + '<tg-spoiler>' + body_html + '</tg-spoiler>' + strip_prem(extra_part) + strip_prem(cap_footer) + strip_prem(proxy_footer) + strip_prem(base_part) + strip_prem(ch_part)
             try:
                 await bot.send_message(channel, cap_html, parse_mode=ParseMode.HTML)
                 sent = True
@@ -1347,10 +1495,20 @@ async def msg_set_cap_emoji_count(message: types.Message, state: FSMContext):
         await message.answer("❌ عدد نامعتبر.")
     await state.clear()
 
+def strip_links(t):
+    if not t: return ''
+    t = re.sub(r'https?://\S+', '', t)
+    t = re.sub(r't\.me/\S+', '', t, flags=re.I)
+    t = re.sub(r'www\.\S+', '', t, flags=re.I)
+    t = re.sub(r'@[A-Za-z0-9_]{4,}', '', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
 def preview_kb(pid, is_spoiler):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ تایید", callback_data=f"approve_{pid}"), InlineKeyboardButton(text="❌ رد", callback_data=f"reject_{pid}")],
         [InlineKeyboardButton(text=f"⚠️ اسپویلر: {'روشن ✅' if is_spoiler else 'خاموش ❌'}", callback_data=f"toggle_spoiler_{pid}"), InlineKeyboardButton(text="✏️ ویرایش", callback_data=f"editprev_{pid}")],
+        [InlineKeyboardButton(text="🧹 حذف لینک/یوزر", callback_data=f"striplinks_{pid}")],
     ])
 
 @router.callback_query(F.data.startswith("toggle_spoiler_"))
@@ -1378,6 +1536,21 @@ async def msg_set_sp_id_emoji(message: types.Message, state: FSMContext):
     await db.set('sp_id_emoji', message.text.strip())
     await message.answer(f"✅ ذخیره شد: {message.text.strip()}", reply_markup=menu_kb())
     await state.clear()
+
+@router.callback_query(F.data.startswith("striplinks_"))
+async def cb_striplinks(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[1])
+    async with aiosqlite.connect('auto_pub.db') as conn:
+        row = await (await conn.execute("SELECT text FROM batch_posts WHERE id=?", (pid,))).fetchone()
+        if row and row[0]:
+            new_text = strip_links(row[0])
+            await conn.execute("UPDATE batch_posts SET text=? WHERE id=?", (new_text, pid))
+            await conn.commit()
+    await callback.answer("✅ لینک/یوزر حذف شد.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=preview_kb(pid, False))
+    except Exception:
+        pass
 
 async def show_pre_view(chat_id):
     fixed = (await db.get('pre_fixed')) or ''
@@ -1579,10 +1752,10 @@ async def msg_prev_footer(message: types.Message, state: FSMContext):
     pid = data.get('pid')
     added = extract_tags(message)
     async with aiosqlite.connect('auto_pub.db') as conn:
-        row = await (await conn.execute("SELECT text FROM batch_posts WHERE id=?", (pid,))).fetchone()
+        row = await (await conn.execute("SELECT foot FROM batch_posts WHERE id=?", (pid,))).fetchone()
         old = row[0] or ''
         new = (old + '\n' + added).strip() if old else added
-        await conn.execute("UPDATE batch_posts SET text=? WHERE id=?", (new, pid))
+        await conn.execute("UPDATE batch_posts SET foot=? WHERE id=?", (new, pid))
         await conn.commit()
     await state.clear()
     try: await message.delete()
@@ -1611,6 +1784,11 @@ async def main():
             logger.info("premium client ready")
         except Exception as e:
             logger.error(f"premium start: {e}")
+    async with aiosqlite.connect('auto_pub.db') as conn:
+        try:
+            await conn.execute("ALTER TABLE sources ADD COLUMN grp TEXT DEFAULT 'day'")
+        except Exception: pass
+        await conn.commit()
     asyncio.create_task(scheduler())
     asyncio.create_task(proxy_scheduler())
     # asyncio.create_task(auto_batch())
