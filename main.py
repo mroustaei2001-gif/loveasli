@@ -37,6 +37,19 @@ if os.path.exists('/root/premium_session.session') and not os.path.exists('premi
 if os.path.exists('/root/premium_session.session-journal') and not os.path.exists('premium_session.session-journal'):
     shutil.copy('/root/premium_session.session-journal', 'premium_session.session-journal')
 
+
+# اضافه کردن ستون واترمارک به دیتابیس
+try:
+    import sqlite3 as _sqlite3
+    _conn = _sqlite3.connect('auto_pub.db')
+    _conn.execute("ALTER TABLE batch_posts ADD COLUMN has_watermark INTEGER DEFAULT 0")
+    _conn.commit()
+    _conn.close()
+    print("✅ ستون has_watermark به دیتابیس اضافه شد")
+except Exception as _e:
+    if "duplicate column" not in str(_e).lower():
+        print(f"️ خطا در اضافه کردن ستون: {_e}")
+
 telethon_client = TelegramClient('reader_session', API_ID, API_HASH)
 premium_client = TelegramClient('premium_session', API_ID, API_HASH)
 PUBLISH_ERR = None
@@ -251,6 +264,7 @@ def settings_kb():
         [InlineKeyboardButton(text="🆔 ایموجی ایدی", callback_data="set_id_emoji")],
         [InlineKeyboardButton(text="⚠️ ایموجی ایدی اسپویلر", callback_data="set_sp_id_emoji")],
         [InlineKeyboardButton(text="🔗 فوتر پروکسی", callback_data="set_proxy_footer")],
+        [InlineKeyboardButton(text="💧 واترمارک", callback_data="set_watermark_id")],
         [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="menu")],
     ])
 
@@ -700,12 +714,17 @@ async def get_album_paths(source, msg_id):
         for i in ids:
             base = os.path.join(MEDIA_DIR, f"{source.strip('@')}_{i}")
             found = None
-            for ext in ('.jpg', '.mp4'):
+            for ext in ('.jpg', '.mp4', '.gif', '.webm'):
                 if os.path.exists(base+ext): found = base+ext; break
             if not found:
                 mm = await telethon_client.get_messages(entity, ids=i)
-                ext = '.mp4' if (mm.file and mm.file.mime_type=='video/mp4') else '.jpg'
+                mime = (mm.file.mime_type or '').lower() if mm.file else ''
+                if 'video/mp4' in mime or 'video/webm' in mime or 'gif' in mime:
+                    ext = '.mp4'
+                else:
+                    ext = '.jpg'
                 found = base+ext
+                print(f"📥 دانلود آلبوم: {source}/{i} -> {found} (MIME: {mime})")
                 await telethon_client.download_media(mm, found)
             if found and os.path.exists(found): paths.append(found)
         return paths or ([await get_media_path(source, msg_id)])
@@ -715,7 +734,7 @@ async def get_album_paths(source, msg_id):
 
 async def get_media_path(source, msg_id):
     base = os.path.join(MEDIA_DIR, f"{source.strip('@')}_{msg_id}")
-    for ext in ('.jpg', '.mp4'):
+    for ext in ('.jpg', '.mp4', '.gif', '.webm'):
         if os.path.exists(base+ext): return base+ext
     path = base + '.jpg'
     if not telethon_client.is_connected():
@@ -724,8 +743,13 @@ async def get_media_path(source, msg_id):
         entity = await telethon_client.get_entity(source)
         msg = await telethon_client.get_messages(entity, ids=msg_id)
         if msg and msg.media:
-            ext = '.mp4' if (msg.file and msg.file.mime_type=='video/mp4') else '.jpg'
+            mime = (msg.file.mime_type or '').lower() if msg.file else ''
+            if 'video/mp4' in mime or 'video/webm' in mime or 'gif' in mime:
+                ext = '.mp4'
+            else:
+                ext = '.jpg'
             path = base+ext
+            print(f"📥 دانلود: {source}/{msg_id} -> {path} (MIME: {mime})")
             await telethon_client.download_media(msg, path)
             return path if os.path.exists(path) else None
     except Exception as e:
@@ -907,10 +931,10 @@ async def cleanup_chat(chat_id):
             PREVIEW_MSGS.remove((cid,mid))
 async def send_preview(chat_id, pid):
     async with aiosqlite.connect('auto_pub.db') as conn:
-        row = await (await conn.execute("SELECT source, msg_id, text, media, is_spoiler FROM batch_posts WHERE id=?", (pid,))).fetchone()
+        row = await (await conn.execute("SELECT source, msg_id, text, media, is_spoiler, COALESCE(has_watermark, 0) as has_watermark FROM batch_posts WHERE id=?", (pid,))).fetchone()
     if not row: return
-    source, mid, text, media, is_spoiler = row
-    kb = preview_kb(pid, is_spoiler)
+    source, mid, text, media, is_spoiler, has_watermark = row[0], row[1], row[2], row[3], row[4], (row[5] if len(row) > 5 else 0)
+    kb = preview_kb(pid, is_spoiler, has_watermark)
     def reg(m):
         try:
             lst = m if isinstance(m,(list,tuple)) else [m]
@@ -1161,16 +1185,82 @@ async def publish_all_approved(chat_id):
         logger.error(f"publish_all: {e}")
         await bot.send_message(chat_id, f"❌ خطا: {e}", reply_markup=menu_kb())
 
+
+def apply_watermark_video(video_path, watermark_text):
+    import subprocess
+    try:
+        base, ext = os.path.splitext(video_path)
+        output_path = base + '_wm' + ext
+        font = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+        
+        # استفاده از الحاق رشته‌ای ساده برای جلوگیری از خطای سینتکس
+        vf = "drawtext=text='" + str(watermark_text) + "':fontfile=" + font + ":fontcolor=white:alpha=0.35:fontsize=h/20:x=(w-text_w)/2:y=(h-text_h)/2+(h/8)"
+        
+        ext_lower = ext.lower()
+        if ext_lower in ['.gif', '.webm', '.mp4']:
+            if ext_lower == '.gif':
+                cmd = ['ffmpeg', '-y', '-i', video_path, '-vf', vf, '-loop', '0', output_path]
+            else:
+                cmd = ['ffmpeg', '-y', '-i', video_path, '-vf', vf, '-c:v', 'libx264', '-c:a', 'copy', '-preset', 'fast', output_path]
+            
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if r.returncode == 0 and os.path.exists(output_path):
+                return output_path
+            
+            print('❌ ffmpeg failed on:', video_path)
+            print('Command:', ' '.join(cmd))
+            print('Full Stderr:\n', r.stderr)
+        return video_path
+    except Exception as e:
+        print('⚠️ video watermark error:', e)
+        return video_path
+
+def apply_watermark(image_path, watermark_text):
+    try:
+        if image_path.endswith(('.mp4', '.gif', '.webm')):
+            return apply_watermark_video(image_path, watermark_text)
+        from PIL import Image, ImageDraw, ImageFont
+        img = Image.open(image_path).convert("RGBA")
+        txt_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(txt_layer)
+        
+        font_size = max(20, min(img.size[0] // 15, 60))
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+        
+        bbox = draw.textbbox((0, 0), watermark_text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        
+        x = (img.size[0] - text_width) // 2
+        y = (img.size[1] - text_height) // 2 + (img.size[1] // 8)
+        
+        draw.text((x, y), watermark_text, fill=(255, 255, 255, 80), font=font)
+        
+        watermarked = Image.alpha_composite(img, txt_layer)
+        
+        output_path = image_path.rsplit('.', 1)[0] + '_wm.jpg'
+        watermarked.convert("RGB").save(output_path, "JPEG", quality=95)
+        return output_path
+    except Exception as e:
+        print(f"⚠️ خطا در اعمال واترمارک: {e}")
+        return image_path
+
 async def do_publish(pid):
     global PUBLISH_ERR, PREMIUM_ERR, DBG
     NL = chr(10)
     try:
         async with aiosqlite.connect('auto_pub.db') as conn:
-            row = await (await conn.execute("SELECT source, msg_id, text, media, fmt, foot, is_spoiler FROM batch_posts WHERE id=?", (pid,))).fetchone()
+            row = await (await conn.execute("SELECT source, msg_id, text, media, fmt, foot, is_spoiler, COALESCE(has_watermark, 0) as has_watermark FROM batch_posts WHERE id=?", (pid,))).fetchone()
         if not row:
             PUBLISH_ERR = "پست پیدا نشد"
             return False
-        source, mid, text, media, pfmt, pfoot, is_spoiler = row
+        source, mid, text, media, pfmt, pfoot, is_spoiler = row[0], row[1], row[2], row[3], row[4], row[5], row[6]
+        source, mid, text, media, pfmt, pfoot, is_spoiler = row[0], row[1], row[2], row[3], row[4], row[5], row[6]
+        has_watermark = row[7] if len(row) > 7 else 0
+        has_watermark = row[7] if len(row) > 7 else 0
         is_spoiler = bool(is_spoiler)
         fmt = pfmt or await db.get('format')
         extra = pfoot or ''
@@ -1258,6 +1348,14 @@ async def do_publish(pid):
             paths = await get_album_paths(source, mid)
             path = paths[0] if paths else None
         if media and len(paths) > 1:
+            if has_watermark and paths:
+                wm_text = await db.get('watermark_id') or ''
+                if wm_text:
+                    watermarked_paths = []
+                    for p in paths:
+                        wm_path = apply_watermark(p, wm_text)
+                        watermarked_paths.append(wm_path)
+                    paths = watermarked_paths
             ok=False; sent_via='none'
             if not is_spoiler and '<tg-emoji' in caption and os.path.exists('premium_session.session'):
                 try:
@@ -1288,6 +1386,10 @@ async def do_publish(pid):
         sent_via = 'none'
         prem_exists = os.path.exists('premium_session.session')
         if is_spoiler and path:
+            if has_watermark:
+                wm_text = await db.get('watermark_id') or ''
+                if wm_text:
+                    path = apply_watermark(path, wm_text)
             cap2 = remove_emoji_tags(strip_prem(caption))
             try:
                 if path.endswith('.mp4'):
@@ -1308,6 +1410,11 @@ async def do_publish(pid):
             except Exception as e1:
                 PUBLISH_ERR = str(e1)
         else:
+            # WM_NORMAL - واترمارک برای پست عادی
+            if has_watermark and path:
+                wm_text = await db.get('watermark_id') or ''
+                if wm_text:
+                    path = apply_watermark(path, wm_text)
             if '<tg-emoji' in caption and prem_exists:
                 for attempt in range(3):
                     try:
@@ -1326,6 +1433,10 @@ async def do_publish(pid):
                 cap2 = strip_prem(caption)
                 try:
                     if path:
+                        if has_watermark:
+                            wm_text = await db.get('watermark_id') or ''
+                            if wm_text:
+                                path = apply_watermark(path, wm_text)
                         if path.endswith('.mp4'):
                             await bot.send_animation(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML)
                         else:
@@ -1472,6 +1583,45 @@ async def publish_all_scheduled(chat_id):
         logger.error(f"publish_all_sch: {e}")
         await bot.send_message(chat_id, f"❌ خطا: {e}", reply_markup=menu_kb())
 
+
+from aiogram.filters import StateFilter
+
+@router.callback_query(F.data == "set_watermark_id")
+async def cb_set_watermark_id(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        await callback.message.edit_text("🆔 آیدی واترمارک را ارسال کنید (مثال: @mychannel):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت", callback_data="settings")]]))
+    except Exception:
+        await bot.send_message(callback.from_user.id, "🆔 آیدی واترمارک را ارسال کنید (مثال: @mychannel):")
+    await state.set_state('waiting_watermark_id')
+    await callback.answer()
+
+@router.message(F.text, StateFilter('waiting_watermark_id'))
+async def msg_set_watermark_id(message: types.Message, state: FSMContext):
+    await db.set('watermark_id', message.text.strip())
+    await message.answer(f"✅ آیدی واترمارک ذخیره شد: {message.text.strip()}", reply_markup=main_menu_kb())
+    await state.clear()
+
+@router.callback_query(F.data.startswith("toggle_watermark_"))
+async def cb_toggle_watermark(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[2])
+    async with aiosqlite.connect('auto_pub.db') as conn:
+        try:
+            await conn.execute("ALTER TABLE batch_posts ADD COLUMN has_watermark INTEGER DEFAULT 0")
+            await conn.commit()
+        except Exception:
+            pass
+        row = await (await conn.execute("SELECT has_watermark, is_spoiler FROM batch_posts WHERE id=?", (pid,))).fetchone()
+        current = row[0] if row and row[0] else 0
+        new_status = 0 if current else 1
+        is_spoiler = bool(row[1]) if row else False
+        await conn.execute("UPDATE batch_posts SET has_watermark=? WHERE id=?", (new_status, pid))
+        await conn.commit()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=preview_kb(pid, is_spoiler, new_status))
+    except Exception:
+        pass
+    await callback.answer(f"واترمارک {'روشن ✅' if new_status else 'خاموش ❌'}")
+
 async def scheduler():
     while True:
         try:
@@ -1526,11 +1676,12 @@ def strip_links(t):
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
-def preview_kb(pid, is_spoiler):
+def preview_kb(pid, is_spoiler, has_watermark=0):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ تایید", callback_data=f"approve_{pid}"), InlineKeyboardButton(text="❌ رد", callback_data=f"reject_{pid}")],
         [InlineKeyboardButton(text=f"⚠️ اسپویلر: {'روشن ✅' if is_spoiler else 'خاموش ❌'}", callback_data=f"toggle_spoiler_{pid}"), InlineKeyboardButton(text="✏️ ویرایش", callback_data=f"editprev_{pid}")],
         [InlineKeyboardButton(text="🧹 حذف لینک/یوزر", callback_data=f"striplinks_{pid}")],
+        [InlineKeyboardButton(text=f"💧 واترمارک: {'روشن ✅' if has_watermark else 'خاموش ❌'}", callback_data=f"toggle_watermark_{pid}")],
     ])
 
 @router.callback_query(F.data.startswith("toggle_spoiler_"))
@@ -1546,6 +1697,28 @@ async def cb_toggle_spoiler(callback: types.CallbackQuery):
     except Exception:
         pass
     await callback.answer(f"اسپویلر {'روشن ✅' if new_status else 'خاموش ❌'}")
+
+@router.callback_query(F.data.startswith("toggle_watermark_"))
+async def cb_toggle_watermark(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[2])
+    async with aiosqlite.connect('auto_pub.db') as conn:
+        try:
+            await conn.execute("ALTER TABLE batch_posts ADD COLUMN has_watermark INTEGER DEFAULT 0")
+            await conn.commit()
+        except:
+            pass
+        row = await (await conn.execute("SELECT has_watermark FROM batch_posts WHERE id=?", (pid,))).fetchone()
+        current = row[0] if row and row[0] else 0
+        new_status = 0 if current else 1
+        await conn.execute("UPDATE batch_posts SET has_watermark=? WHERE id=?", (new_status, pid))
+        await conn.commit()
+    try:
+        row2 = await (await conn.execute("SELECT is_spoiler FROM batch_posts WHERE id=?", (pid,))).fetchone()
+        is_spoiler = bool(row2[0]) if row2 else False
+        await callback.message.edit_reply_markup(reply_markup=preview_kb(pid, is_spoiler, new_status))
+    except Exception:
+        pass
+    await callback.answer(f"واترمارک {'روشن ✅' if new_status else 'خاموش ❌'}")
 
 @router.callback_query(F.data == "set_sp_id_emoji")
 async def cb_set_sp_id_emoji(callback: types.CallbackQuery, state: FSMContext):
