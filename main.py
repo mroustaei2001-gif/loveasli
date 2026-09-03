@@ -3,6 +3,7 @@ import os, re, random, asyncio, logging, sqlite3, subprocess
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from html import escape as html_escape
+from html import unescape as html_unescape
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
@@ -124,32 +125,185 @@ def get_emojis(text):
 
 def clean_text(text):
     if not text: return ''
-    text = re.sub(r'https?://\S+|www\.\S+|t\.me/\S+', '', text)
-    text = re.sub(r'@\w+', '', text)
-    text = re.sub(r'#\w+', '', text)
-    return re.sub(r'\s+', ' ', text).strip()
+    # جدا کردن تگ‌های HTML از متن
+    tags = re.findall(r'<[^>]+>', text)
+    plain = re.sub(r'<[^>]+>', ' ', text)
+    
+    # پاک کردن markdown
+    plain = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', plain)
+    plain = re.sub(r'\*{2,}', '', plain)
+    plain = re.sub(r'(?<!\*)\*(?!\*)', '', plain)
+    
+    # پاک کردن URLs
+    plain = re.sub(r'https?://\S+', '', plain)
+    plain = re.sub(r'(?<![<>/="\'])t\.me/\S+', '', plain)
+    plain = re.sub(r'(?<![<>/="\'])telegram\.me/\S+', '', plain)
+    plain = re.sub(r'(?<![<>/="\'])www\.\S+', '', plain)
+    
+    # پاک کردن دامنه‌ها
+    plain = re.sub(r'\b[A-Za-z0-9][A-Za-z0-9.-]*\.(com|net|org|ir|io|co|bet|site|online|xyz|top|info|me|cc|tk|fun|club|vip)\b', '', plain, flags=re.I)
+    
+    # پاک کردن @username و #hashtag
+    plain = re.sub(r'(?<![<>/="\'])@[A-Za-z0-9_]{4,}', '', plain)
+    plain = re.sub(r'#\w+', '', plain)
+    
+    # پاک کردن فاصله‌ها
+    plain = re.sub(r'[ \t]+', ' ', plain)
+    plain = re.sub(r'\n{3,}', '\n\n', plain)
+    
+    return plain.strip()
+
 
 def format_text(text, mode):
-    parts = re.split(r'(<tg-emoji[^>]*>.*?</tg-emoji>)', text or '')
-    t = ''.join(p if p.startswith('<tg-emoji') else html_escape(p) for p in parts)
+    if not text: return ''
+    html_tags = r'(<tg-emoji[^>]*>.*?</tg-emoji>|<tg-spoiler>.*?</tg-spoiler>|<b>.*?</b>|<i>.*?</i>|<u>.*?</u>|<s>.*?</s>|<code>.*?</code>|<pre>.*?</pre>|<blockquote>.*?</blockquote>|<a[^>]*>.*?</a>)'
+    parts = re.split(html_tags, text or '', flags=re.DOTALL)
+    t = ''.join(p if re.match(html_tags, p, re.DOTALL) else html_escape(html_unescape(p)) for p in parts if p)
     if mode == 'bold': return f"<b>{t}</b>"
     if mode == 'blockquote': return f"<blockquote>{t}</blockquote>"
     if mode == 'bold_blockquote': return f"<blockquote><b>{t}</b></blockquote>"
+    if mode == 'italic': return f"<i>{t}</i>"
+    if mode == 'monospace': return f"<pre>{t}</pre>"
+    if mode == 'code': return f"<code>{t}</code>"
     return t
 
+def sanitize_html(text):
+    if not text: return ''
+    # 1. حذف ستاره‌های markdown
+    text = re.sub(r'\*+', '', text)
+    # 2. حذف تگ‌های خالی (مثل <b></b> یا <blockquote></blockquote>) - چند مرحله برای تودرتو
+    for _ in range(6):
+        new = re.sub(r'<(b|i|u|s|code|pre|tg-spoiler|blockquote)>(?:\s|\u200c|\u200f|\u00a0)*</\1>', '', text)
+        if new == text: break
+        text = new
+    # 3. توازن تگ‌ها (حذف باز/بسته اضافی)
+    for tag in ['b','i','u','s','code','pre','tg-spoiler','blockquote']:
+        o = '<%s>' % tag
+        cl = '</%s>' % tag
+        opens = text.count(o)
+        closes = text.count(cl)
+        while opens > closes:
+            i = text.rfind(o)
+            if i == -1: break
+            text = text[:i] + text[i+len(o):]
+            opens -= 1
+        while closes > opens:
+            i = text.find(cl)
+            if i == -1: break
+            text = text[:i] + text[i+len(cl):]
+            closes -= 1
+    # 4. حذف دوباره تگ‌های خالی بعد از توازن
+    for _ in range(6):
+        new = re.sub(r'<(b|i|u|s|code|pre|tg-spoiler|blockquote)>(?:\s|\u200c|\u200f|\u00a0)*</\1>', '', text)
+        if new == text: break
+        text = new
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+def ent_type(e):
+    t = getattr(e, 'type', None)
+    if isinstance(t, str): return t
+    return type(e).__name__.replace('MessageEntity', '').lower()
+
+def ent_type(e):
+    t = getattr(e, 'type', None)
+    if isinstance(t, str): return t
+    return type(e).__name__.replace('MessageEntity', '').lower()
+
 def extract_tags(message):
-    if not message.entities: return (message.text or '').strip()
-    tags = [e for e in message.entities if e.type == 'custom_emoji' and e.custom_emoji_id]
-    if not tags: return (message.text or '').strip()
-    u = (message.text or '').encode('utf-16-le')
-    res, last = [], 0
-    for e in tags:
-        res.append(u[last*2:e.offset*2].decode('utf-16-le', 'ignore'))
-        ch = u[e.offset*2:(e.offset+e.length)*2].decode('utf-16-le', 'ignore') or '⭐'
-        res.append(f'<tg-emoji emoji-id="{e.custom_emoji_id}">{ch}</tg-emoji>')
-        last = e.offset + e.length
-    res.append(u[last*2:].decode('utf-16-le', 'ignore'))
-    return ''.join(res).strip()
+    text = message.text or ''
+    if not text: return ''
+    ents = message.entities or []
+    if not ents: return html_escape(text)
+    tag_map = {
+        'bold': ('b', 'b'),
+        'italic': ('i', 'i'),
+        'underline': ('u', 'u'),
+        'strike': ('s', 's'),
+        'code': ('code', 'code'),
+        'pre': ('pre', 'pre'),
+        'spoiler': ('tg-spoiler', 'tg-spoiler'),
+        'blockquote': ('blockquote', 'blockquote'),
+    }
+    # ایجاد events: شروع و پایان هر entity
+    events = []
+    for e in ents:
+        et = ent_type(e)
+        if et == 'customemoji' and getattr(e, 'custom_emoji_id', None):
+            events.append((e.offset, 'start_custom', e.custom_emoji_id, e.length))
+            events.append((e.offset + e.length, 'end_custom', None, 0))
+        elif et in tag_map:
+            events.append((e.offset, 'start', et, e.length))
+            events.append((e.offset + e.length, 'end', et, 0))
+    # مرتب‌سازی: اول position، بعد start قبل از end
+    events.sort(key=lambda x: (x[0], 0 if x[1].startswith('start') else 1, -x[3] if x[1].startswith('start') else 0))
+    
+    out = []
+    stack = []
+    pos = 0
+    u = text.encode('utf-16-le')
+    
+    for ev in events:
+        p, typ, tag, length = ev
+        if p > pos:
+            # متن بین position فعلی و event
+            chunk = u[pos*2:p*2].decode('utf-16-le', 'ignore')
+            out.append(html_escape(chunk))
+            pos = p
+        
+        if typ == 'start':
+            stack.append(tag)
+            out.append(f'<{tag_map[tag][0]}>')
+        elif typ == 'start_custom':
+            stack.append(('custom', tag))
+        elif typ == 'end':
+            # بستن تگ‌های باز تا رسیدن به این تگ
+            to_close = []
+            while stack and stack[-1] != tag:
+                to_close.append(stack.pop())
+            if stack:
+                stack.pop()
+            # بستن تگ‌های بالا
+            for t in reversed(to_close):
+                out.append(f'</{tag_map[t][1]}>')
+            out.append(f'</{tag_map[tag][1]}>')
+            # باز کردن تگ‌های باقی‌مانده
+            for t in to_close:
+                stack.append(t)
+                out.append(f'<{tag_map[t][0]}>')
+        elif typ == 'end_custom':
+            # حذف از stack
+            for i in range(len(stack)-1, -1, -1):
+                if isinstance(stack[i], tuple) and stack[i][0] == 'custom':
+                    custom_id = stack[i][1]
+                    stack.pop(i)
+                    break
+    
+    if pos < len(text):
+        chunk = u[pos*2:].decode('utf-16-le', 'ignore')
+        out.append(html_escape(chunk))
+    
+    # بستن همه تگ‌های باز باقی‌مانده
+    for t in reversed(stack):
+        if isinstance(t, tuple):
+            continue
+        out.append(f'</{tag_map[t][1]}>')
+    
+    result = ''.join(out)
+    # اعتبارسنجی: اگر تگ‌های باز یا بسته نامتعادل داشت، متن ساده برگردان
+    open_count = result.count('<b>') + result.count('<i>') + result.count('<blockquote>') + result.count('<pre>') + result.count('<code>')
+    close_count = result.count('</b>') + result.count('</i>') + result.count('</blockquote>') + result.count('</pre>') + result.count('</code>')
+    if open_count != close_count:
+        # HTML خراب است، فقط custom emoji و اسپویلر را نگه دار
+        return strip_bad_html(result)
+    return sanitize_html(result.strip())
+
+def strip_bad_html(text):
+    # حذف همه تگ‌ها به جز tg-emoji
+    text = re.sub(r'</?(?:b|i|u|s|code|pre|tg-spoiler|blockquote)[^>]*>', '', text)
+    return text
+
 
 def truncate_html(s, limit):
     if len(s) <= limit: return s
@@ -263,7 +417,7 @@ def settings_kb():
         [InlineKeyboardButton(text="🎲 فوتر رندوم", callback_data="set_rand_footer")],
         [InlineKeyboardButton(text="🆔 ایموجی ایدی", callback_data="set_id_emoji")],
         [InlineKeyboardButton(text="⚠️ ایموجی ایدی اسپویلر", callback_data="set_sp_id_emoji")],
-        [InlineKeyboardButton(text="🔗 فوتر پروکسی", callback_data="set_proxy_footer")],
+        [InlineKeyboardButton(text="🔗 فوتر پروکسی", callback_data="set_proxy_footer"), InlineKeyboardButton(text="✏️ متن پروکسی", callback_data="set_proxy_text")],
         [InlineKeyboardButton(text="💧 واترمارک", callback_data="set_watermark_id")],
         [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="menu")],
     ])
@@ -770,7 +924,10 @@ async def cb_new_batch(callback: types.CallbackQuery):
     try: await status.delete()
     except Exception: pass
 
-async def generate_batch(chat_id):
+async def generate_batch(chat_id, _depth=0):
+    if _depth > 10:
+        await bot.send_message(chat_id, "⚠️ هیچ پست جدیدی در هیچ منبعی یافت نشد. لطفاً منابع جدید اضافه کنید.", reply_markup=menu_kb())
+        return
     if not telethon_client.is_connected(): await telethon_client.connect()
     async with aiosqlite.connect('auto_pub.db') as conn:
         sources = await (await conn.execute("SELECT id, username FROM sources")).fetchall()
@@ -837,30 +994,38 @@ async def generate_batch(chat_id):
                 if main_id and eid and eid==main_id: continue
                 if str(uname).startswith('+'):
                     await conn.execute("UPDATE sources SET username=? WHERE id=?", (str(utils.get_peer_id(entity)), sid))
-                async for m in telethon_client.iter_messages(entity, limit=200):
+                msgs=[]
+                async for m in telethon_client.iter_messages(entity, limit=10):
                     if time.monotonic()>deadline: break
-                    if not m: continue
+                    if m: msgs.append(m)
+                group_caps={}
+                for m in reversed(msgs):
+                    gid=getattr(m,'grouped_id',None)
+                    if gid and (m.text or '').strip():
+                        group_caps.setdefault(gid, m)
+                for m in msgs:
                     is_used=(uname,m.id) in used
                     if getattr(m,'sticker',None): continue
                     if isinstance(m.media,MessageMediaDocument) and m.file and ('webp' in (m.file.mime_type or '') or 'webm' in (m.file.mime_type or '')): continue
-                    has_sp=bool(getattr(m,'media_spoiler',False)) or any(getattr(e,'type','')=='spoiler' for e in (m.entities or []))
-                    _txt=m.text or ''
-                    if re.search(r'https?://|t\.me/|www\.|telegram\.me', _txt, re.I): continue
-                    if any(getattr(e,'type','') in ('url','text_link') for e in (m.entities or [])): continue
-                    ct=clean_text(_txt)
-                    ct=re.sub(r'@[A-Za-z0-9_]{4,}','',ct)
-                    ct=re.sub(r'\s+',' ',ct).strip()
+                    has_sp=bool(getattr(m,'media_spoiler',False)) or any(ent_type(e)=='spoiler' for e in (m.entities or []))
+                    gid=getattr(m,'grouped_id',None)
+                    cap_msg=group_caps.get(gid, m) if gid else m
+                    _txt = extract_tags(cap_msg) or ''
+                    ct = clean_text(_txt)
+                    # بازسازی تگ‌ها: فقط تگ‌های معتبر را نگه دار
+                    ct = sanitize_html(ct)
+                    plain = re.sub(r'<[^>]+>', '', ct)
                     item=None
-                    if m.grouped_id:
-                        if m.grouped_id in seen_grouped: continue
-                        seen_grouped.add(m.grouped_id)
+                    if gid:
+                        if gid in seen_grouped: continue
+                        seen_grouped.add(gid)
                         if isinstance(m.media,(MessageMediaPhoto,MessageMediaDocument)):
                             item=(uname,m.id,ct,1 if has_sp else 0,'album',m.date)
                     elif isinstance(m.media,MessageMediaPhoto):
                         item=(uname,m.id,ct,1 if has_sp else 0,'photo',m.date)
                     elif isinstance(m.media,MessageMediaDocument) and m.file and m.file.mime_type=='video/mp4':
                         item=(uname,m.id,ct,1 if has_sp else 0,'gif',m.date)
-                    elif not m.media and ct and len(ct)>=3:
+                    elif not m.media and len(plain)>=5:
                         item=(uname,m.id,ct,1 if has_sp else 0,'text',m.date)
                     if item:
                         if item[4]=='text': text_all.append((is_used,item))
@@ -871,7 +1036,8 @@ async def generate_batch(chat_id):
     # گروه‌بندی بر اساس منبع
     from_src = {}
     for is_used, item in media_all + text_all:
-        if item[4] == 'text' and len(item[2] or '') < 3: continue
+        if is_used: continue
+        if item[4] == 'text' and len(re.sub(r'<[^>]+>', '', item[2] or '')) < 3: continue
         uname = item[0]
         if uname not in from_src: from_src[uname] = []
         from_src[uname].append((is_used, item))
@@ -880,23 +1046,37 @@ async def generate_batch(chat_id):
     random.shuffle(src_list)
     for uname in src_list:
         if len(chosen) >= 5: break
-        items = sorted(from_src[uname], key=lambda x: x[0])
+        items = sorted(from_src[uname], key=lambda x: -x[1][5].timestamp() if x[1][5] else 0)
         chosen.append(items[0][1])
     if len(chosen) < 5:
         all_items = []
         for uname in from_src:
             for is_used, item in from_src[uname]:
                 all_items.append((is_used, item))
-        all_items.sort(key=lambda x: x[0])
+        all_items.sort(key=lambda x: -x[1][5].timestamp() if x[1][5] else 0)
         for is_used, item in all_items:
             if len(chosen) >= 5: break
             if item in chosen: continue
             chosen.append(item)
+    
+    # بررسی: پست‌های تازه در دسته انتخابی
+    chosen_ids = {it[1] for it in chosen}
+    fresh_count = sum(1 for uname in from_src for is_used, item in from_src[uname] if item[1] in chosen_ids and not is_used)
+    
     await db.set('batch_group_index', str((cur_idx+1)%total_groups))
+    
     if not chosen:
-        msg=f"⚠️ پستی از دسته {cur_idx+1}/{total_groups} پیدا نشد."
+        msg=f"⚠️ پست جدید از دسته {cur_idx+1}/{total_groups} پیدا نشد.\n➡️ ارجاع به دسته بعدی..."
         if errs: msg+="\n🔍 " + " | ".join(errs[:5])
-        return await bot.send_message(chat_id, msg, reply_markup=menu_kb())
+        await bot.send_message(chat_id, msg, reply_markup=menu_kb())
+        await generate_batch(chat_id, _depth + 1)
+        return
+    
+    if fresh_count == 0 and len(chosen) > 0:
+        msg=f"⚠️ در دسته {cur_idx+1}/{total_groups} پست جدیدی وجود ندارد ({len(chosen)} تکراری).\n➡️ ارجاع به دسته بعدی..."
+        await bot.send_message(chat_id, msg, reply_markup=menu_kb())
+        await generate_batch(chat_id, _depth + 1)
+        return
     random.shuffle(chosen)
     final=chosen[:5]
     async with aiosqlite.connect('auto_pub.db') as conn:
@@ -1248,6 +1428,22 @@ def apply_watermark(image_path, watermark_text):
         print(f"⚠️ خطا در اعمال واترمارک: {e}")
         return image_path
 
+def normalize_channel(ch):
+    """تبدیل URL کانال به @username یا chat_id عددی"""
+    if not ch: return ch
+    ch = str(ch).strip()
+    ch = re.sub(r'^https?://t\.me/', '', ch)
+    ch = re.sub(r'^https?://telegram\.me/', '', ch)
+    ch = ch.rstrip('/')
+    # آیدی عددی -> int
+    if ch.lstrip('-').isdigit():
+        return int(ch)
+    # یوزرنیم -> حتماً با @
+    if not ch.startswith('@'):
+        ch = '@' + ch
+    return ch
+
+
 async def do_publish(pid):
     global PUBLISH_ERR, PREMIUM_ERR, DBG
     NL = chr(10)
@@ -1329,6 +1525,53 @@ async def do_publish(pid):
         
         allowed = 1024 - tlen(pre) - tlen(extra_part) - tlen(base_part) - tlen(proxy_footer) - tlen(ch_part) - tlen(cap_footer) - 60
         body = truncate_html(body_full, max(200, allowed))
+        async def send_with_fallback(kind, path=None, caption=None, spoiler=False):
+            ch = normalize_channel(channel)
+            logger.info(f"📤 ارسال {kind} به {ch} (spoiler={spoiler})")
+            try:
+                if kind == 'photo':
+                    return await bot.send_photo(ch, FSInputFile(path), caption=caption, parse_mode=ParseMode.HTML, has_spoiler=spoiler)
+                if kind == 'animation':
+                    return await bot.send_animation(ch, FSInputFile(path), caption=caption, parse_mode=ParseMode.HTML, has_spoiler=spoiler)
+                return await bot.send_message(ch, caption, parse_mode=ParseMode.HTML)
+            except Exception as bot_err:
+                logger.error(f"BOT FAIL kind={kind} channel={channel!r} spoiler={spoiler} err={bot_err}")
+                if not os.path.exists('premium_session.session'):
+                    logger.error('❌ premium_session.session وجود ندارد!')
+                    raise
+                try:
+                    if not premium_client.is_connected():
+                        await premium_client.connect()
+                    if kind in ('photo', 'animation'):
+                        return await premium_client.send_file(ch, path, caption=caption, parse_mode='html', spoiler=spoiler)
+                    raw = caption or ''
+                    # حفظ ایموجی‌های داخل tg-emoji به صورت کاراکتر ساده
+                    txt = re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', raw, flags=re.S)
+                    try:
+                        # ارسال با HTML تا فونت/اسپویلر/بولد حفظ شود و &quot; به " تبدیل شود
+                        res = await premium_client.send_message(ch, txt, parse_mode='html')
+                        logger.info(f"PREMIUM OK kind={kind}")
+                        return res
+                    except Exception:
+                        # fallback نهایی: متن ساده + entity اسپویلر
+                        from telethon.tl.types import MessageEntitySpoiler
+                        plain = ''
+                        segs = []
+                        last = 0
+                        for mm in re.finditer(r'<tg-spoiler>(.*?)</tg-spoiler>', raw, re.S):
+                            before = html_unescape(re.sub(r'<[^>]+>', '', raw[last:mm.start()]))
+                            inside = html_unescape(re.sub(r'<[^>]+>', '', mm.group(1)))
+                            plain += before
+                            segs.append((len(plain), len(inside)))
+                            plain += inside
+                            last = mm.end()
+                        plain += html_unescape(re.sub(r'<[^>]+>', '', raw[last:]))
+                        ents = [MessageEntitySpoiler(offset=off, length=ln) for off, ln in segs]
+                        return await premium_client.send_message(ch, plain, entities=ents)
+                except Exception as prem_err:
+                    logger.error(f"PREMIUM FAIL kind={kind} ch={ch} err={prem_err}", exc_info=True)
+                    raise bot_err
+
         def build_caption(b):
             if media:
                 cb = b + extra_part + cap_footer
@@ -1360,7 +1603,7 @@ async def do_publish(pid):
             if not is_spoiler and '<tg-emoji' in caption and os.path.exists('premium_session.session'):
                 try:
                     if not premium_client.is_connected(): await premium_client.connect()
-                    await premium_client.send_file(channel, paths, caption=caption, parse_mode='html')
+                    await premium_client.send_file(ch, paths, caption=caption, parse_mode='html')
                     ok=True; sent_via='album-prem'
                 except Exception as e1: PUBLISH_ERR=str(e1)
             if not ok:
@@ -1393,20 +1636,20 @@ async def do_publish(pid):
             cap2 = remove_emoji_tags(strip_prem(caption))
             try:
                 if path.endswith('.mp4'):
-                    await bot.send_animation(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML, has_spoiler=True)
+                    await send_with_fallback('animation', path=path, caption=cap2, spoiler=True)
                 else:
-                    await bot.send_photo(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML, has_spoiler=True)
+                    await send_with_fallback('photo', path=path, caption=cap2, spoiler=True)
                 sent = True
-                sent_via = 'bot-photo'
+                sent_via = 'spoiler-photo'
             except Exception as e1:
                 PUBLISH_ERR = str(e1)
         elif is_spoiler and not path:
             body_html = format_text(text or '', fmt)
             cap_html = remove_emoji_tags(strip_prem(pre)) + '<tg-spoiler>' + body_html + '</tg-spoiler>' + remove_emoji_tags(strip_prem(extra_part)) + remove_emoji_tags(strip_prem(cap_footer)) + remove_emoji_tags(strip_prem(proxy_footer)) + remove_emoji_tags(strip_prem(base_part)) + remove_emoji_tags(strip_prem(ch_part))
             try:
-                await bot.send_message(channel, cap_html, parse_mode=ParseMode.HTML)
+                await send_with_fallback('message', caption=cap_html)
                 sent = True
-                sent_via = 'bot-html-spoiler'
+                sent_via = 'spoiler-text'
             except Exception as e1:
                 PUBLISH_ERR = str(e1)
         else:
@@ -1420,9 +1663,9 @@ async def do_publish(pid):
                     try:
                         if not premium_client.is_connected(): await premium_client.connect()
                         if path:
-                            await premium_client.send_file(channel, path, caption=caption, parse_mode='html')
+                            await premium_client.send_file(ch, path, caption=caption, parse_mode='html')
                         else:
-                            await premium_client.send_message(channel, caption, parse_mode='html')
+                            await premium_client.send_message(ch, caption, parse_mode='html')
                         sent = True
                         sent_via = 'premium'
                         break
@@ -1438,11 +1681,11 @@ async def do_publish(pid):
                             if wm_text:
                                 path = apply_watermark(path, wm_text)
                         if path.endswith('.mp4'):
-                            await bot.send_animation(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML)
+                            await bot.send_animation(ch, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML)
                         else:
-                            await bot.send_photo(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML)
+                            await bot.send_photo(ch, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML)
                     else:
-                        await bot.send_message(channel, cap2, parse_mode=ParseMode.HTML)
+                        await bot.send_message(ch, cap2, parse_mode=ParseMode.HTML)
                     sent = True
                     sent_via = 'bot'
                 except Exception as e1:
@@ -1450,9 +1693,9 @@ async def do_publish(pid):
         if not sent:
             plain = re.sub(r'<[^>]+>', '', caption)
             if path:
-                await bot.send_photo(channel, FSInputFile(path), caption=plain, has_spoiler=is_spoiler)
+                await bot.send_photo(ch, FSInputFile(path), caption=plain, has_spoiler=is_spoiler)
             else:
-                await bot.send_message(channel, plain)
+                await bot.send_message(ch, plain)
             sent_via = 'plain'
         DBG_LIST.append(f"#{pid} sp={int(is_spoiler)} cap={int(bool(cap_footer))} via={sent_via}")
         async with aiosqlite.connect('auto_pub.db') as conn:
