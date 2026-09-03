@@ -471,11 +471,48 @@ def get_proxy_link():
         return None
     return random.choice(links)
 
-def make_proxy_link(text):
+
+def test_proxy_connection(link, timeout=3):
+    """تست اتصال واقعی به پروکسی با socket"""
+    import socket
+    import urllib.parse
+    try:
+        parsed = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(parsed.query)
+        server = qs.get('server', [''])[0]
+        port = int(qs.get('port', [0])[0])
+        if not server or not port:
+            return False
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((server, port))
+        sock.close()
+        return result == 0
+    except Exception as e:
+        logger.error(f"test_proxy error: {e}")
+        return False
+
+def get_working_proxy(timeout=3):
+    """گرفتن یک پروکسی سالم با تست اتصال"""
     links = get_proxy_links()
     if not links:
+        return None
+    # تست تصادفی تا پیدا کردن پروکسی سالم
+    import random
+    random.shuffle(links)
+    for link in links[:5]:  # حداکثر 5 تا تست کن
+        if test_proxy_connection(link, timeout):
+            logger.info(f"✅ پروکسی سالم: {link[:50]}...")
+            return link
+    logger.warning(f"⚠️ هیچ پروکسی سالمی پیدا نشد از {len(links)} پروکسی")
+    return None
+
+def make_proxy_link(text):
+    link = get_working_proxy(timeout=2)
+    if not link:
+        # اگر پروکسی سالم نیست، متن ساده برگردان
+        logger.warning(f"⚠️ پروکسی سالم موجود نیست برای: {text[:30]}")
         return text
-    link = random.choice(links)
     return f'<a href="{link}">{text}</a>'
 
 async def proxy_scheduler():
